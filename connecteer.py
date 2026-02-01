@@ -3,14 +3,120 @@ import cv2
 import numpy as np
 import socket
 import json
+import struct
 import threading
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QPushButton, QLabel, QSlider, 
+import select
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QSlider,
                              QLineEdit, QGroupBox, QGridLayout)
 from PyQt5.QtCore import Qt, pyqtSignal, QThread
 from PyQt5.QtGui import QImage, QPixmap
 import pyrealsense2 as rs
 import mediapipe as mp
+
+
+class WebcamReceiverThread(QThread):
+    """
+    Receives webcam stream from server with low-latency optimizations:
+    - JPEG decoding (matches server's JPEG encoding)
+    - Frame dropping to always display newest frame
+    - Non-blocking socket with timeout
+    """
+    frame_ready = pyqtSignal(np.ndarray)
+    connection_status = pyqtSignal(str)
+
+    def __init__(self, host, port=8001):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.running = False
+        self.socket = None
+
+    def run(self):
+        self.running = True
+        self.connection_status.emit("Connecting to webcam...")
+
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Set socket options for low latency
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Reduce receive buffer to minimize latency
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            self.socket.settimeout(5.0)  # Connection timeout
+            self.socket.connect((self.host, self.port))
+            self.socket.settimeout(0.1)  # Short timeout for non-blocking reads
+            self.connection_status.emit("Webcam connected")
+        except Exception as e:
+            self.connection_status.emit(f"Webcam error: {e}")
+            self.running = False
+            return
+
+        data_buffer = b""
+        payload_size = struct.calcsize("Q")
+
+        while self.running:
+            try:
+                # Use select to check if data is available (non-blocking)
+                ready = select.select([self.socket], [], [], 0.01)
+                if not ready[0]:
+                    continue
+
+                # Receive all available data (drain the buffer to get latest frame)
+                while True:
+                    try:
+                        chunk = self.socket.recv(65536)
+                        if not chunk:
+                            self.connection_status.emit("Webcam disconnected")
+                            self.running = False
+                            break
+                        data_buffer += chunk
+                    except socket.timeout:
+                        break  # No more data available right now
+                    except BlockingIOError:
+                        break
+
+                # Process all complete frames, keep only the last one
+                last_frame = None
+                while len(data_buffer) >= payload_size:
+                    # Extract message size
+                    msg_size = struct.unpack("Q", data_buffer[:payload_size])[0]
+
+                    # Check if we have complete frame
+                    if len(data_buffer) < payload_size + msg_size:
+                        break  # Wait for more data
+
+                    # Extract frame data
+                    frame_data = data_buffer[payload_size:payload_size + msg_size]
+                    data_buffer = data_buffer[payload_size + msg_size:]
+
+                    # Decode JPEG frame
+                    frame_array = np.frombuffer(frame_data, dtype=np.uint8)
+                    frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+
+                    if frame is not None:
+                        last_frame = frame
+
+                # Only emit the most recent frame (drop older ones)
+                if last_frame is not None:
+                    self.frame_ready.emit(last_frame)
+
+            except Exception as e:
+                if self.running:
+                    self.connection_status.emit(f"Webcam error: {e}")
+                break
+
+        if self.socket:
+            self.socket.close()
+        self.connection_status.emit("Webcam stopped")
+
+    def stop(self):
+        self.running = False
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+
 
 class CameraThread(QThread):
     """Handles RealSense camera and hand tracking"""
@@ -95,12 +201,13 @@ class RobotArmController(QMainWindow):
         super().__init__()
         self.setWindowTitle("Robot Arm Controller")
         self.setGeometry(100, 100, 900, 700)
-        
+
         self.pi_socket = None
         self.camera_thread = None
+        self.webcam_thread = None
         self.tracking_mode = False
         self.servo_positions = [90, 90, 90, 90]
-        
+
         self.init_ui()
         
     def init_ui(self):
@@ -133,10 +240,14 @@ class RobotArmController(QMainWindow):
         
         # Controls
         ctrl_layout = QHBoxLayout()
-        self.camera_btn = QPushButton("Start Camera")
+        self.camera_btn = QPushButton("Start RealSense")
         self.camera_btn.clicked.connect(self.toggle_camera)
         ctrl_layout.addWidget(self.camera_btn)
-        
+
+        self.webcam_btn = QPushButton("Start Pi Webcam")
+        self.webcam_btn.clicked.connect(self.toggle_webcam)
+        ctrl_layout.addWidget(self.webcam_btn)
+
         self.track_btn = QPushButton("Start Tracking Mode")
         self.track_btn.clicked.connect(self.toggle_tracking)
         self.track_btn.setEnabled(False)
@@ -184,13 +295,35 @@ class RobotArmController(QMainWindow):
         if self.camera_thread and self.camera_thread.isRunning():
             self.camera_thread.stop()
             self.camera_thread.wait()
-            self.camera_btn.setText("Start Camera")
+            self.camera_btn.setText("Start RealSense")
         else:
+            # Stop webcam if running
+            if self.webcam_thread and self.webcam_thread.isRunning():
+                self.toggle_webcam()
             self.camera_thread = CameraThread()
             self.camera_thread.frame_ready.connect(self.update_frame)
             self.camera_thread.hand_data.connect(self.update_hand_data)
             self.camera_thread.start()
-            self.camera_btn.setText("Stop Camera")
+            self.camera_btn.setText("Stop RealSense")
+
+    def toggle_webcam(self):
+        if self.webcam_thread and self.webcam_thread.isRunning():
+            self.webcam_thread.stop()
+            self.webcam_thread.wait()
+            self.webcam_btn.setText("Start Pi Webcam")
+        else:
+            # Stop RealSense if running
+            if self.camera_thread and self.camera_thread.isRunning():
+                self.toggle_camera()
+            host = self.ip_input.text()
+            self.webcam_thread = WebcamReceiverThread(host, port=8001)
+            self.webcam_thread.frame_ready.connect(self.update_frame)
+            self.webcam_thread.connection_status.connect(self.update_webcam_status)
+            self.webcam_thread.start()
+            self.webcam_btn.setText("Stop Pi Webcam")
+
+    def update_webcam_status(self, status):
+        self.status_label.setText(status)
             
     def toggle_tracking(self):
         self.tracking_mode = not self.tracking_mode
@@ -234,6 +367,9 @@ class RobotArmController(QMainWindow):
         if self.camera_thread:
             self.camera_thread.stop()
             self.camera_thread.wait()
+        if self.webcam_thread:
+            self.webcam_thread.stop()
+            self.webcam_thread.wait()
         if self.pi_socket:
             self.pi_socket.close()
         event.accept()

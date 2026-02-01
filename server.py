@@ -270,65 +270,80 @@ def webcam_server():
     """
     Separate server for streaming webcam feed
     Runs on port 8001
+
+    Optimized for low latency:
+    - Uses JPEG compression instead of pickle (10-50x smaller)
+    - TCP_NODELAY to disable Nagle's algorithm
+    - No artificial delays
+    - Reduced buffer sizes
     """
     print("\n[WEBCAM] Starting webcam server on port 8001...")
-    
+
     # Create socket for video streaming
     video_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     video_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     video_server.bind(('0.0.0.0', 8001))
     video_server.listen(5)
-    
+
     print("[WEBCAM] Webcam server ready, waiting for connections...")
-    
+
     while True:
         try:
             client_socket, addr = video_server.accept()
             print(f"[WEBCAM] Client connected from {addr}")
-            
+
+            # Optimize socket for low latency
+            client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # Reduce send buffer to prevent frame accumulation
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+
             # Start webcam capture
             cap = cv2.VideoCapture(0)  # USB webcam (use 0 for default, or try 1, 2 if needed)
-            
+
             # Set camera properties for better performance
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS, 30)
-            
+            # Reduce camera buffer to get freshest frames
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
             if not cap.isOpened():
                 print("[WEBCAM] Error: Could not open webcam")
                 client_socket.close()
                 continue
-            
-            print("[WEBCAM] Webcam opened successfully, streaming...")
-            
+
+            print("[WEBCAM] Webcam opened successfully, streaming with JPEG compression...")
+
             try:
                 while True:
                     ret, frame = cap.read()
                     if not ret:
                         print("[WEBCAM] Failed to capture frame")
                         break
-                    
-                    # Serialize frame
-                    data = pickle.dumps(frame)
-                    message_size = struct.pack("Q", len(data))
-                    
+
+                    # Encode frame as JPEG (much smaller than pickle)
+                    # Quality 80 gives good balance of size vs quality
+                    _, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    data = encoded.tobytes()
+
                     # Send message size and frame data
+                    message_size = struct.pack("Q", len(data))
                     try:
                         client_socket.sendall(message_size + data)
                     except:
                         print("[WEBCAM] Client disconnected")
                         break
-                    
-                    # Small delay to control frame rate
-                    time.sleep(0.033)  # ~30 FPS
-                    
+
+                    # No sleep - let camera capture rate control timing
+                    # This prevents frame accumulation and reduces latency
+
             except Exception as e:
                 print(f"[WEBCAM] Error during streaming: {e}")
             finally:
                 cap.release()
                 client_socket.close()
                 print("[WEBCAM] Client disconnected, webcam released")
-                
+
         except Exception as e:
             print(f"[WEBCAM] Connection error: {e}")
 
