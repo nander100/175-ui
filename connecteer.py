@@ -376,10 +376,19 @@ class RobotArmController(QMainWindow):
             640, 480, Qt.KeepAspectRatio))
 
     def update_pi_webcam_frame(self, frame):
-        h, w, ch = frame.shape
-        qt_img = QImage(frame.data, w, h, ch * w, QImage.Format_RGB888)
-        self.pi_webcam_label.setPixmap(QPixmap.fromImage(qt_img.rgbSwapped()).scaled(
-            640, 480, Qt.KeepAspectRatio))
+        # Handle both color (BGR) and grayscale frames
+        if len(frame.shape) == 2:
+            # Grayscale frame
+            h, w = frame.shape
+            qt_img = QImage(frame.data, w, h, w, QImage.Format_Grayscale8)
+            self.pi_webcam_label.setPixmap(QPixmap.fromImage(qt_img).scaled(
+                640, 480, Qt.KeepAspectRatio))
+        else:
+            # Color frame (BGR)
+            h, w, ch = frame.shape
+            qt_img = QImage(frame.data, w, h, ch * w, QImage.Format_RGB888)
+            self.pi_webcam_label.setPixmap(QPixmap.fromImage(qt_img.rgbSwapped()).scaled(
+                640, 480, Qt.KeepAspectRatio))
 
     def update_webcam_status(self, status):
         self.webcam_status_label.setText(f"Status: {status}")

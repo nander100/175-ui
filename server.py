@@ -271,13 +271,24 @@ def webcam_server():
     Separate server for streaming webcam feed
     Runs on port 8001
 
-    Optimized for low latency:
-    - Uses JPEG compression instead of pickle (10-50x smaller)
+    Optimized for low latency and maximum compression:
+    - Aggressive JPEG compression (quality 40, optimized Huffman tables)
+    - Optional grayscale mode for 3x smaller frames
     - TCP_NODELAY to disable Nagle's algorithm
-    - No artificial delays
     - Reduced buffer sizes
+
+    Typical frame sizes at 640x480:
+    - Raw: 921 KB
+    - JPEG Q80: ~30-50 KB
+    - JPEG Q40 optimized: ~10-15 KB
+    - JPEG Q40 grayscale: ~5-8 KB
     """
+    # Configuration - adjust these as needed
+    USE_GRAYSCALE = False  # Set True for 3x smaller frames (no color)
+    JPEG_QUALITY = 40      # 0-100, lower = smaller but more artifacts
+
     print("\n[WEBCAM] Starting webcam server on port 8001...")
+    print(f"[WEBCAM] Compression: JPEG Q{JPEG_QUALITY}, Grayscale: {USE_GRAYSCALE}")
 
     # Create socket for video streaming
     video_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -286,6 +297,12 @@ def webcam_server():
     video_server.listen(5)
 
     print("[WEBCAM] Webcam server ready, waiting for connections...")
+
+    # JPEG encoding parameters for maximum compression
+    encode_params = [
+        cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY,
+        cv2.IMWRITE_JPEG_OPTIMIZE, 1,  # Optimize Huffman tables (smaller file)
+    ]
 
     while True:
         try:
@@ -312,7 +329,7 @@ def webcam_server():
                 client_socket.close()
                 continue
 
-            print("[WEBCAM] Webcam opened successfully, streaming with JPEG compression...")
+            print("[WEBCAM] Webcam opened, streaming...")
 
             try:
                 while True:
@@ -321,9 +338,12 @@ def webcam_server():
                         print("[WEBCAM] Failed to capture frame")
                         break
 
-                    # Encode frame as JPEG (much smaller than pickle)
-                    # Quality 80 gives good balance of size vs quality
-                    _, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    # Convert to grayscale if enabled (3x smaller)
+                    if USE_GRAYSCALE:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                    # Encode with aggressive JPEG compression
+                    _, encoded = cv2.imencode('.jpg', frame, encode_params)
                     data = encoded.tobytes()
 
                     # Send message size and frame data
@@ -333,9 +353,6 @@ def webcam_server():
                     except:
                         print("[WEBCAM] Client disconnected")
                         break
-
-                    # No sleep - let camera capture rate control timing
-                    # This prevents frame accumulation and reduces latency
 
             except Exception as e:
                 print(f"[WEBCAM] Error during streaming: {e}")
