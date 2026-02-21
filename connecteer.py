@@ -14,6 +14,11 @@ from PyQt5.QtGui import QImage, QPixmap
 import pyrealsense2 as rs
 import mediapipe as mp
 
+
+# ============================================================================
+# CameraThread class - Handles RealSense camera and hand tracking
+# ============================================================================
+
 class CameraThread(QThread):
     """Handles RealSense camera and hand tracking"""
     frame_ready = pyqtSignal(np.ndarray)
@@ -63,23 +68,42 @@ class CameraThread(QThread):
                 cx = int(sum([lm.x for lm in hand.landmark]) / 21 * w)
                 cy = int(sum([lm.y for lm in hand.landmark]) / 21 * h)
 
-                # Get 3D position
-                depth = depth_frame.get_distance(cx, cy)
-                intrin = depth_frame.profile.as_video_stream_profile().intrinsics
-                point_3d = rs.rs2_deproject_pixel_to_point(intrin, [cx, cy], depth)
-                position = np.array([[point_3d[0]], [point_3d[1]], [point_3d[2]]])
+                # Clamp coordinates to valid frame bounds (prevent out of range errors)
+                cx = max(0, min(cx, w - 1))
+                cy = max(0, min(cy, h - 1))
 
-                # Calculate finger bend (index finger)
-                mcp, pip, dip = hand.landmark[5], hand.landmark[6], hand.landmark[7]
-                v1 = np.array([pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z])
-                v2 = np.array([dip.x - pip.x, dip.y - pip.y, dip.z - pip.z])
-                angle = np.degrees(np.arccos(np.clip(np.dot(v1, v2) /
-                                   (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1)))
+                try:
+                    # Get 3D position
+                    depth = depth_frame.get_distance(cx, cy)
+                    
+                    # Skip if depth is invalid (0 or too far)
+                    if depth == 0 or depth > 5.0:
+                        # Still draw the hand but don't emit data
+                        cv2.circle(color_image, (cx, cy), 10, (0, 0, 255), -1)  # Red for invalid depth
+                        continue
+                    
+                    intrin = depth_frame.profile.as_video_stream_profile().intrinsics
+                    point_3d = rs.rs2_deproject_pixel_to_point(intrin, [cx, cy], depth)
+                    position = np.array([[point_3d[0]], [point_3d[1]], [point_3d[2]]])
 
-                # Draw center point
-                cv2.circle(color_image, (cx, cy), 10, (0, 255, 0), -1)
+                    # Calculate finger bend (index finger)
+                    mcp, pip, dip = hand.landmark[5], hand.landmark[6], hand.landmark[7]
+                    v1 = np.array([pip.x - mcp.x, pip.y - mcp.y, pip.z - mcp.z])
+                    v2 = np.array([dip.x - pip.x, dip.y - pip.y, dip.z - pip.z])
+                    angle = np.degrees(np.arccos(np.clip(np.dot(v1, v2) /
+                                       (np.linalg.norm(v1) * np.linalg.norm(v2)), -1, 1)))
 
-                self.hand_data.emit(position, angle)
+                    # Draw center point in green for valid tracking
+                    cv2.circle(color_image, (cx, cy), 10, (0, 255, 0), -1)
+
+                    self.hand_data.emit(position, angle)
+                    
+                except (RuntimeError, Exception) as e:
+                    # Handle any RealSense errors gracefully
+                    print(f"[Camera] Error getting hand position: {e}")
+                    # Draw center point in orange for error state
+                    cv2.circle(color_image, (cx, cy), 10, (0, 165, 255), -1)
+                    continue
 
             self.frame_ready.emit(color_image)
 
@@ -89,6 +113,10 @@ class CameraThread(QThread):
     def stop(self):
         self.running = False
 
+
+# ============================================================================
+# PiWebcamThread class - Receives webcam stream from Raspberry Pi
+# ============================================================================
 
 class PiWebcamThread(QThread):
     """
@@ -194,6 +222,10 @@ class PiWebcamThread(QThread):
                 pass
 
 
+# ============================================================================
+# Main Controller Class
+# ============================================================================
+
 class RobotArmController(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -204,8 +236,16 @@ class RobotArmController(QMainWindow):
         self.camera_thread = None
         self.pi_webcam_thread = None
         self.tracking_mode = False
-        self.servo_positions = [0, 50, 90, 90]  # base, arm1, arm2, gripper
-        self.speed = 50  # Default speed
+        
+        # Default servo positions (middle of ranges)
+        self.servo_positions = [45, 105, 105, 125]
+        self.speed = 50
+        
+        # Rate limiting and change detection
+        self.last_servo_send_time = 0
+        self.servo_send_interval = 0.1  # Max 20 Hz (50ms between commands)
+        self.last_sent_positions = [45, 105, 105, 125]
+        self.servo_change_threshold = 5  # Send if any servo changed by 1+ degree
 
         self.init_ui()
 
@@ -291,28 +331,65 @@ class RobotArmController(QMainWindow):
         speed_layout.addWidget(self.speed_label)
         layout.addWidget(speed_group)
 
-        # Servos
+        # Servos with button controls - CENTERED
         servo_group = QGroupBox("Manual Servo Control")
-        servo_layout = QGridLayout(servo_group)
-        self.sliders = []
-        self.labels = []
-
-        servo_names = ["Base (0-90°)", "Arm1 (50-100°)", "Arm2 (90-150°)", "Gripper (90-160°)"]
-        servo_ranges = [(0, 90), (50, 100), (90, 150), (90, 160)]
-        servo_defaults = [0, 50, 90, 90]
+        servo_main_layout = QHBoxLayout(servo_group)
+        
+        # Add stretches on both sides to center the content
+        servo_main_layout.addStretch()
+        
+        # Create the actual servo control grid
+        servo_layout = QGridLayout()
+        
+        self.angle_inputs = []  # Store QLineEdit widgets for angle display/input
+        
+        # Servo ranges and defaults
+        servo_names = ["Base (0-90°)", "Arm1 (70-140°)", "Arm2 (80-130°)", "Gripper (90-160°)"]
+        servo_ranges = [(0, 90), (70, 140), (80, 130), (90, 160)]
+        servo_defaults = [45, 105, 105, 125]  # Middle positions for all servos
 
         for i in range(4):
-            servo_layout.addWidget(QLabel(servo_names[i]), i, 0)
-            slider = QSlider(Qt.Horizontal)
-            slider.setRange(servo_ranges[i][0], servo_ranges[i][1])
-            slider.setValue(servo_defaults[i])
-            slider.valueChanged.connect(lambda v, idx=i: self.servo_changed(idx, v))
-            servo_layout.addWidget(slider, i, 1)
-            label = QLabel(f"{servo_defaults[i]}°")
-            servo_layout.addWidget(label, i, 2)
-            self.sliders.append(slider)
-            self.labels.append(label)
+            # Servo label
+            label = QLabel(servo_names[i])
+            label.setMinimumWidth(120)
+            servo_layout.addWidget(label, i, 0)
+            
+            # -10 button
+            btn_minus_10 = QPushButton("-10")
+            btn_minus_10.setFixedWidth(60)
+            btn_minus_10.clicked.connect(lambda checked, idx=i: self.adjust_angle(idx, -10))
+            servo_layout.addWidget(btn_minus_10, i, 1)
+            
+            # -1 button
+            btn_minus_1 = QPushButton("-1")
+            btn_minus_1.setFixedWidth(50)
+            btn_minus_1.clicked.connect(lambda checked, idx=i: self.adjust_angle(idx, -1))
+            servo_layout.addWidget(btn_minus_1, i, 2)
+            
+            # Angle input/display textbox
+            angle_input = QLineEdit(str(servo_defaults[i]))
+            angle_input.setFixedWidth(70)
+            angle_input.setAlignment(Qt.AlignCenter)
+            angle_input.setProperty("servo_index", i)
+            angle_input.returnPressed.connect(self.on_manual_entry)
+            self.angle_inputs.append(angle_input)
+            servo_layout.addWidget(angle_input, i, 3)
+            
+            # +1 button
+            btn_plus_1 = QPushButton("+1")
+            btn_plus_1.setFixedWidth(50)
+            btn_plus_1.clicked.connect(lambda checked, idx=i: self.adjust_angle(idx, 1))
+            servo_layout.addWidget(btn_plus_1, i, 4)
+            
+            # +10 button
+            btn_plus_10 = QPushButton("+10")
+            btn_plus_10.setFixedWidth(60)
+            btn_plus_10.clicked.connect(lambda checked, idx=i: self.adjust_angle(idx, 10))
+            servo_layout.addWidget(btn_plus_10, i, 5)
 
+        servo_main_layout.addLayout(servo_layout)
+        servo_main_layout.addStretch()
+        
         layout.addWidget(servo_group)
 
     def toggle_connection(self):
@@ -362,12 +439,52 @@ class RobotArmController(QMainWindow):
     def toggle_tracking(self):
         self.tracking_mode = not self.tracking_mode
         self.track_btn.setText("Stop Tracking" if self.tracking_mode else "Start Tracking Mode")
-        for slider in self.sliders:
-            slider.setEnabled(not self.tracking_mode)
+        
+        # Disable/enable angle input boxes in tracking mode
+        for angle_input in self.angle_inputs:
+            angle_input.setEnabled(not self.tracking_mode)
 
     def speed_changed(self, value):
         self.speed = value
         self.speed_label.setText(str(value))
+
+    def adjust_angle(self, idx, delta):
+        """Adjust servo angle by delta amount"""
+        if self.tracking_mode:
+            return  # Don't allow manual adjustments in tracking mode
+        
+        servo_ranges = [(0, 90), (70, 140), (80, 130), (90, 160)]
+        min_angle, max_angle = servo_ranges[idx]
+        
+        current = self.servo_positions[idx]
+        new_angle = max(min_angle, min(max_angle, current + delta))
+        self.servo_positions[idx] = new_angle
+        self.angle_inputs[idx].setText(str(new_angle))
+        self.send_servos()
+
+    def manual_angle_entry(self, idx):
+        """Handle manual angle entry from textbox"""
+        if self.tracking_mode:
+            self.angle_inputs[idx].setText(str(self.servo_positions[idx]))
+            return
+        
+        servo_ranges = [(0, 90), (70, 140), (80, 130), (90, 160)]
+        min_angle, max_angle = servo_ranges[idx]
+        
+        try:
+            new_angle = int(self.angle_inputs[idx].text())
+            new_angle = max(min_angle, min(max_angle, new_angle))
+            self.servo_positions[idx] = new_angle
+            self.angle_inputs[idx].setText(str(new_angle))
+            self.send_servos()
+        except ValueError:
+            self.angle_inputs[idx].setText(str(self.servo_positions[idx]))
+
+    def on_manual_entry(self):
+        """Handle manual angle entry - gets the index from the sender"""
+        sender = self.sender()
+        idx = sender.property("servo_index")
+        self.manual_angle_entry(idx)
 
     def update_frame(self, frame):
         h, w, ch = frame.shape
@@ -384,22 +501,118 @@ class RobotArmController(QMainWindow):
     def update_webcam_status(self, status):
         self.webcam_status_label.setText(f"Status: {status}")
 
+    # ========================================================================
+    # DIRECT CAMERA-TO-SERVO MAPPING (No IK)
+    # ========================================================================
+
     def update_hand_data(self, position, bend_angle):
-        self.hand_info.setText(
-            f"Position: X={position[0][0]:.2f}m Y={position[1][0]:.2f}m Z={position[2][0]:.2f}m | "
-            f"Finger: {bend_angle:.0f}°"
-        )
+        """
+        Process hand tracking data and directly map to servo positions.
+        NO inverse kinematics - direct mapping from camera space to servo space.
 
-        # TODO: Add your inverse kinematics here to convert position -> servo angles
-        # For now, just a placeholder
+        Camera coordinate system:
+            X: Left/right (-X = left, +X = right when facing camera)
+            Y: Up/down   (-Y = up, +Y = down in image coordinates)
+            Z: Depth     (distance from camera, always positive)
+
+        Servo mapping:
+            X (left/right) → Base  servo (0-90°)
+            Z (depth/in-out) → Arm1 servo (70-140°)   ← SWAPPED: was Y
+            Y (up/down)      → Arm2 servo (80-130°)   ← SWAPPED: was Z
+            Finger bend      → Gripper servo (90-160°)
+
+        Rate limiting:
+            - Maximum 20 Hz update rate (50ms between commands)
+            - Only sends if any servo changed by threshold degrees
+        """
+        # Safety check: Validate position data
+        if position is None or position.size == 0:
+            self.hand_info.setText("Hand Position: Lost | Finger: N/A")
+            return
+
+        try:
+            # Extract hand position coordinates (in meters)
+            x_cam, y_cam, z_cam = position[0][0], position[1][0], position[2][0]
+
+            # Check for invalid depth values
+            if not np.isfinite(x_cam) or not np.isfinite(y_cam) or not np.isfinite(z_cam) or z_cam == 0:
+                self.hand_info.setText("Hand Position: Invalid depth | Finger: N/A")
+                return
+
+            # Define camera workspace bounds (detection range)
+            x_cam_min, x_cam_max = -0.5, 0.7   # Left/right range
+            y_cam_min, y_cam_max = -0.2, 0.35  # Up/down range
+            z_cam_min, z_cam_max = 0.3, 0.75   # Depth range
+
+            # Clamp camera coordinates to detection bounds
+            x_cam = np.clip(x_cam, x_cam_min, x_cam_max)
+            y_cam = np.clip(y_cam, y_cam_min, y_cam_max)
+            z_cam = np.clip(z_cam, z_cam_min, z_cam_max)
+
+            # Update display with camera position
+            self.hand_info.setText(
+                f"Cam: X={x_cam:.2f}m Y={y_cam:.2f}m Z={z_cam:.2f}m | Finger: {bend_angle:.0f}°"
+            )
+
+        except (IndexError, TypeError):
+            self.hand_info.setText("Hand Position: Error reading data | Finger: N/A")
+            return
+
+        # Only control robot when tracking mode is active
         if self.tracking_mode:
-            pass  # Calculate and send servo positions based on hand position
+            # DIRECT MAPPING: Camera coordinates → Servo angles
 
-    def servo_changed(self, idx, value):
-        self.servo_positions[idx] = value
-        self.labels[idx].setText(f"{value}°")
-        if not self.tracking_mode:
-            self.send_servos()
+            # Base servo (0-90°): Map X position (left/right)
+            # x_cam: -0.5 (left) to +0.7 (right) → servo: 0° to 90°
+            base_servo = np.interp(x_cam, [x_cam_min, x_cam_max], [0, 90])
+
+            # Arm1 servo (70-140°): Map Z position (depth / hand in-out)
+            # z_cam: 0.3 (close) to 0.75 (far) → servo: 140° to 70°
+            # Hand closer to camera → higher angle
+            arm1_servo = np.interp(z_cam, [z_cam_min, z_cam_max], [70, 140])
+
+            # Arm2 servo (80-130°): Map Y position (up/down / hand height)
+            # y_cam: -0.2 (up) to +0.35 (down) → servo: 80° to 130°
+            # Hand higher (more negative Y) → lower angle
+            arm2_servo = np.interp(y_cam, [y_cam_min, y_cam_max], [80, 130])
+
+            # Gripper servo (90-160°): Map finger bend angle
+            # bend_angle: 0° (straight) to 180° (bent) → servo: 160° (open) to 90° (closed)
+            gripper_servo = np.interp(bend_angle, [0, 180], [160, 90])
+
+            # Clamp to physical servo limits and convert to integers
+            servo_angles = [
+                int(np.clip(base_servo,    0,  90)),
+                int(np.clip(arm1_servo,   70, 140)),
+                int(np.clip(arm2_servo,   80, 130)),
+                int(np.clip(gripper_servo, 90, 160))
+            ]
+
+            # Update internal servo positions
+            self.servo_positions = servo_angles
+
+            # Update UI to show current servo positions
+            for i in range(4):
+                self.angle_inputs[i].setText(str(self.servo_positions[i]))
+
+            # Rate limiting + change detection
+            import time
+            current_time = time.time()
+
+            time_passed = current_time - self.last_servo_send_time >= self.servo_send_interval
+            position_changed = any(
+                abs(self.servo_positions[i] - self.last_sent_positions[i]) >= self.servo_change_threshold
+                for i in range(4)
+            )
+
+            if time_passed and position_changed:
+                self.send_servos()
+                self.last_servo_send_time = current_time
+                self.last_sent_positions = self.servo_positions.copy()
+
+                print(f"[Tracking] Cam: X={x_cam:.2f} Y={y_cam:.2f} Z={z_cam:.2f} "
+                      f"→ Servo: Base={servo_angles[0]}° Arm1={servo_angles[1]}° "
+                      f"Arm2={servo_angles[2]}° Gripper={servo_angles[3]}°")
 
     def send_servos(self):
         if self.pi_socket:
